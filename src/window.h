@@ -95,6 +95,9 @@ struct window
     CFStringRef title;
     CGRect frame;
     CGRect windowed_frame;
+    // Event-loop-owned recovery state; never treat an AX write as confirmation.
+    CGRect frame_retry_frame;
+    CGRect frame_retry_target;
     bool is_root;
     bool is_eligible;
     uint8_t notification;

@@ -3,7 +3,28 @@ unsigned int __src_osax_payload_len;
 unsigned char __src_osax_loader[1];
 unsigned int __src_osax_loader_len;
 
+#import <Cocoa/Cocoa.h>
+#import <ApplicationServices/ApplicationServices.h>
+
+static AXError test_frame_ax_copy(AXUIElementRef, CFStringRef, CFTypeRef *);
+static AXError test_frame_ax_set(AXUIElementRef, CFStringRef, CFTypeRef);
+CFStringRef test_frame_display(int, uint64_t);
+uint32_t test_frame_display_id(CFUUIDRef);
+CFUUIDRef test_frame_display_uuid(uint32_t);
+uint64_t test_frame_current_space(int, CFStringRef);
+#define AXUIElementCopyAttributeValue test_frame_ax_copy
+#define AXUIElementSetAttributeValue test_frame_ax_set
+#define SLSCopyManagedDisplayForSpace test_frame_display
+#define CGDisplayGetDisplayIDFromUUID test_frame_display_id
+#define CGDisplayCreateUUIDFromDisplayID test_frame_display_uuid
+#define SLSManagedDisplayGetCurrentSpace test_frame_current_space
 #include "../../src/manifest.m"
+#undef AXUIElementCopyAttributeValue
+#undef AXUIElementSetAttributeValue
+#undef SLSCopyManagedDisplayForSpace
+#undef CGDisplayGetDisplayIDFromUUID
+#undef CGDisplayCreateUUIDFromDisplayID
+#undef SLSManagedDisplayGetCurrentSpace
 
 #define TEST_SIG(name) bool test_##name(void)
 typedef TEST_SIG(function);
@@ -12,11 +33,14 @@ typedef TEST_SIG(function);
 #define TEST_CHECK(r, e) if ((r) != (e)) { printf("                   \e[1;33m%s\e[m\e[1;31m#%d %s == %s\e[m \e[1;31m(%d == %d)\e[m\n", test_name, __LINE__, #r, #e, r, e); result = false; }
 
 #include "area.c"
+#include "window_frame.c"
 
 #define TEST_ENTRY(name) { #name, test_##name },
 #define TEST_LIST                                              \
     TEST_ENTRY(display_area_is_in_direction)                   \
-    TEST_ENTRY(closest_display_in_direction)
+    TEST_ENTRY(closest_display_in_direction)                    \
+    TEST_ENTRY(managed_window_frame_recovery)                   \
+    TEST_ENTRY(managed_window_frame_recovery_safeguards)
 
 static struct {
     char *name;
