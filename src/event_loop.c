@@ -672,6 +672,51 @@ static EVENT_HANDLER(WINDOW_FOCUSED)
     event_signal_push(SIGNAL_WINDOW_FOCUSED, window);
 }
 
+static void window_reconcile_debounced_frame(struct window *window, CGRect frame)
+{
+    if (CGRectIsEmpty(frame) ||
+        window_check_flag(window, WINDOW_FULLSCREEN) ||
+        window_check_flag(window, WINDOW_MINIMIZE) ||
+        CGRectEqualToRect(window->windowed_frame, window->frame) ||
+        g_mouse_state.window == window) return;
+
+    struct view *view = window_manager_find_managed_window(&g_window_manager, window);
+    if (!view) return;
+
+    struct window_node *node = view_find_window_node(view, window->id);
+    if (!node) return;
+
+    // Keep the same tolerance and leaf/zoom exemptions as normal frame events.
+    if ((!AX_DIFF(node->area.x, frame.origin.x) &&
+         !AX_DIFF(node->area.y, frame.origin.y) &&
+         !AX_DIFF(node->area.w, frame.size.width) &&
+         !AX_DIFF(node->area.h, frame.size.height)) ||
+        (node->zoom && !AX_DIFF(node->zoom->area.x, frame.origin.x) &&
+                       !AX_DIFF(node->zoom->area.y, frame.origin.y) &&
+                       !AX_DIFF(node->zoom->area.w, frame.size.width) &&
+                       !AX_DIFF(node->zoom->area.h, frame.size.height))) {
+        window->frame_retry_target = CGRectZero;
+        return;
+    }
+
+    if (window_is_fullscreen(window)) return;
+
+    struct area area = node->zoom ? node->zoom->area : node->area;
+    CGRect target = CGRectMake(area.x, area.y, area.w, area.h);
+    if (CGRectEqualToRect(window->frame_retry_frame, frame) &&
+        CGRectEqualToRect(window->frame_retry_target, target)) return;
+
+    // One recovery per unchanged frame/target pair. Refused or constrained AX
+    // writes may generate more notifications; do not turn those into a loop.
+    window->frame_retry_frame = frame;
+    window->frame_retry_target = target;
+    if (space_is_visible(view->sid)) {
+        window_node_flush(node);
+    } else {
+        view_set_flag(view, VIEW_IS_DIRTY);
+    }
+}
+
 static EVENT_HANDLER(WINDOW_MOVED)
 {
     uint32_t window_id = (uint32_t)(intptr_t) context;
@@ -690,10 +735,12 @@ static EVENT_HANDLER(WINDOW_MOVED)
 
     CGPoint new_origin = window_ax_origin(window);
     if (CGPointEqualToPoint(new_origin, window->frame.origin)) {
+        window_reconcile_debounced_frame(window, window_ax_frame(window));
         debug("%s:DEBOUNCED %s %d\n", __FUNCTION__, window->application->name, window->id);
         return;
     }
 
+    window->frame_retry_target = CGRectZero;
     debug("%s: %s %d\n", __FUNCTION__, window->application->name, window->id);
     event_signal_push(SIGNAL_WINDOW_MOVED, window);
     bool windowed_fullscreen = CGRectEqualToRect(window->windowed_frame, window->frame);
@@ -740,10 +787,12 @@ static EVENT_HANDLER(WINDOW_RESIZED)
 
     CGRect new_frame = window_ax_frame(window);
     if (CGRectEqualToRect(new_frame, window->frame)) {
+        window_reconcile_debounced_frame(window, new_frame);
         debug("%s:DEBOUNCED %s %d\n", __FUNCTION__, window->application->name, window->id);
         return;
     }
 
+    window->frame_retry_target = CGRectZero;
     debug("%s: %s %d\n", __FUNCTION__, window->application->name, window->id);
     event_signal_push(SIGNAL_WINDOW_RESIZED, window);
 
