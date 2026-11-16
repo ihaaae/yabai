@@ -54,6 +54,49 @@ static CFStringRef kAXExposeShowFrontWindows = CFSTR("AXExposeShowFrontWindows")
 static CFStringRef kAXExposeShowDesktop      = CFSTR("AXExposeShowDesktop");
 static CFStringRef kAXExposeExit             = CFSTR("AXExposeExit");
 
+static dispatch_source_t g_mission_control_timer;
+static bool g_mission_control_surface_visible;
+static unsigned g_mission_control_surface_misses;
+
+static void mission_control_poll(void)
+{
+    CFArrayRef window_list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, 0);
+    if (!window_list) return;
+
+    NSArray *applications = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.WindowManager"];
+    pid_t pid = applications.count == 1 ? [applications[0] processIdentifier] : 0;
+    bool shield = false;
+    bool spaces_bar = false;
+
+    for (CFIndex i = 0; pid && i < CFArrayGetCount(window_list); ++i) {
+        CFDictionaryRef window = CFArrayGetValueAtIndex(window_list, i);
+        CFNumberRef owner_ref = CFDictionaryGetValue(window, kCGWindowOwnerPID);
+        CFNumberRef layer_ref = CFDictionaryGetValue(window, kCGWindowLayer);
+        pid_t owner = 0;
+        int layer = 0;
+        if (!owner_ref || !layer_ref) continue;
+        CFNumberGetValue(owner_ref, kCFNumberIntType, &owner);
+        CFNumberGetValue(layer_ref, kCFNumberIntType, &layer);
+        if (owner != pid) continue;
+        shield |= layer == 19;
+        spaces_bar |= layer == 14;
+    }
+    CFRelease(window_list);
+
+    // The shield alone may also occur in other Expose modes. Require the
+    // Spaces bar as well, and tolerate brief surface gaps during animations.
+    if (shield && spaces_bar) {
+        g_mission_control_surface_misses = 0;
+        if (!g_mission_control_surface_visible) {
+            g_mission_control_surface_visible = true;
+            event_loop_post(&g_event_loop, MISSION_CONTROL_SHOW_ALL_WINDOWS, NULL, 0);
+        }
+    } else if (g_mission_control_surface_visible && ++g_mission_control_surface_misses >= 3) {
+        g_mission_control_surface_visible = false;
+        event_loop_post(&g_event_loop, MISSION_CONTROL_EXIT, NULL, 0);
+    }
+}
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 static OBSERVER_CALLBACK(mission_control_notification_handler)
@@ -72,6 +115,19 @@ static OBSERVER_CALLBACK(mission_control_notification_handler)
 
 void mission_control_observe(void)
 {
+    if (workspace_is_macos_goldengate()) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_mission_control_timer) return;
+            g_mission_control_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+            dispatch_source_set_timer(g_mission_control_timer, DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+            dispatch_source_set_event_handler(g_mission_control_timer, ^{
+                @autoreleasepool { mission_control_poll(); }
+            });
+            dispatch_resume(g_mission_control_timer);
+        });
+        return;
+    }
+
     if (!g_mission_control_observer.is_observing) {
         uint32_t pid = workspace_get_dock_pid();
         g_mission_control_observer.ref = AXUIElementCreateApplication(pid);
@@ -92,6 +148,10 @@ void mission_control_observe(void)
 
 void mission_control_unobserve(void)
 {
+    // Called when Dock restarts. The WindowManager watcher is independent
+    // of Dock and must keep its current session and single timer alive.
+    if (workspace_is_macos_goldengate()) return;
+
     if (g_mission_control_observer.is_observing) {
         AXObserverRemoveNotification(g_mission_control_observer.observer_ref, g_mission_control_observer.ref, kAXExposeShowAllWindows);
         AXObserverRemoveNotification(g_mission_control_observer.observer_ref, g_mission_control_observer.ref, kAXExposeShowFrontWindows);
