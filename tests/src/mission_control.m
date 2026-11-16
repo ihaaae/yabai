@@ -10,11 +10,11 @@
 struct event_loop { int unused; };
 struct event_loop g_event_loop;
 volatile uint64_t __last_cmd_tab_time;
-enum { MISSION_CONTROL_ENTER, SLS_SPACE_CREATED, SLS_SPACE_DESTROYED,
+enum { SLS_SPACE_CREATED, SLS_SPACE_DESTROYED,
        SLS_WINDOW_ORDERED, SLS_WINDOW_DESTROYED, MISSION_CONTROL_SHOW_ALL_WINDOWS,
        MISSION_CONTROL_SHOW_FRONT_WINDOWS, MISSION_CONTROL_SHOW_DESKTOP, MISSION_CONTROL_EXIT };
-static bool golden_gate = true;
 static pid_t window_manager_pid = 643;
+static pid_t dock_pid = 674;
 static NSArray *inventory;
 static dispatch_block_t tick;
 static int events[32], event_count;
@@ -54,8 +54,7 @@ static void test_handler(dispatch_source_t source, dispatch_block_t handler)
 static void test_async(dispatch_queue_t queue, dispatch_block_t handler) { handler(); }
 static void test_set_timer(dispatch_source_t source, dispatch_time_t start, uint64_t interval, uint64_t leeway) {}
 static void test_resume(dispatch_object_t source) {}
-static bool workspace_is_macos_goldengate(void) { return golden_gate; }
-static uint32_t workspace_get_dock_pid(void) { return 674; }
+static uint32_t workspace_get_dock_pid(void) { return dock_pid; }
 static AXUIElementRef test_application(pid_t pid) { return (AXUIElementRef)CFRetain(CFSTR("application")); }
 static AXError test_observer(pid_t pid, AXObserverCallback callback, AXObserverRef *observer)
 {
@@ -101,8 +100,10 @@ int main(void)
         mission_control_observe();
         assert(event_count == 0);
 
-        // Dock's old layer and unrelated owners must not trigger sessions.
-        sample(@[window(674,18), window(900,19), window(900,14)], 4);
+        // Wrong owners, incomplete pairs and named Dock windows must not trigger.
+        sample(@[window(900,18), window(900,19), window(900,14)], 4);
+        sample(@[@{(id)kCGWindowOwnerPID: @674, (id)kCGWindowLayer: @18,
+                    (id)kCGWindowName: @"unrelated"}], 4);
         sample(@[window(643,19), window(900,14)], 4);
         sample(@[window(643,14)], 4);
         sample(@[@{}, window(643,16)], 4);
@@ -111,6 +112,9 @@ int main(void)
         NSArray *open = @[window(643,19), window(643,14)];
         sample(open, 4);
         assert(event_count == 1 && events[0] == MISSION_CONTROL_SHOW_ALL_WINDOWS);
+        mission_control_notification_handler(NULL, NULL, kAXExposeShowAllWindows, NULL);
+        mission_control_notification_handler(NULL, NULL, kAXExposeExit, NULL);
+        assert(event_count == 1); // overlapping AX notifications cannot duplicate/end it
 
         // Transient native-query failures and short gaps must not end a session.
         sample(nil, 4);
@@ -143,15 +147,79 @@ int main(void)
         sample(@[window(901,19), window(901,14)], 3);
         assert(event_count == 4 && events[3] == MISSION_CONTROL_EXIT);
 
-        // Earlier macOS releases retain the legacy AX observation path.
-        golden_gate = false;
-        mission_control_observe();
-        mission_control_notification_handler(NULL, NULL, kAXExposeShowFrontWindows, NULL);
+        // Older native signature works even without WindowManager. Both owners
+        // or a runtime handoff still describe one session, not two.
+        event_count = 0;
+        sample(@[], 1);
+        mission_control_notification_handler(NULL, NULL, kAXExposeShowAllWindows, NULL);
+        assert(event_count == 0); // AX alone is not proof of the native surface
+        sample(@[window(674,18)], 4);
+        assert(event_count == 1 && events[0] == MISSION_CONTROL_SHOW_ALL_WINDOWS);
+        window_manager_pid = 901;
+        sample(@[window(674,18), window(901,19), window(901,14)], 2);
+        sample(@[window(901,19), window(901,14)], 2);
+        assert(event_count == 1);
+        sample(@[], 3);
         mission_control_notification_handler(NULL, NULL, kAXExposeExit, NULL);
-        assert(event_count == 6 && events[4] == MISSION_CONTROL_SHOW_FRONT_WINDOWS && events[5] == MISSION_CONTROL_EXIT);
+        assert(event_count == 2 && events[1] == MISSION_CONTROL_EXIT);
+
+        // Refresh Dock identity too; a surface belonging to the old PID fails.
+        dock_pid = 888;
+        sample(@[window(674,18)], 4);
+        assert(event_count == 2);
+        sample(@[window(888,18)], 1);
+        assert(event_count == 3 && events[2] == MISSION_CONTROL_SHOW_ALL_WINDOWS);
+        sample(@[], 3);
+        assert(event_count == 4 && events[3] == MISSION_CONTROL_EXIT);
+        dock_pid = 0;
+        sample(@[window(0,18), window(0,19), window(0,14)], 4);
+        assert(event_count == 4);
+
+        // AX still distinguishes App Expose and Show Desktop. While either is
+        // explicitly active, surface polling must not turn it into full MC.
+        event_count = 0;
+        dock_pid = 888;
+        mission_control_notification_handler(NULL, NULL, kAXExposeShowFrontWindows, NULL);
+        mission_control_notification_handler(NULL, NULL, kAXExposeShowFrontWindows, NULL);
+        sample(@[window(888,18)], 4);
+        sample(@[], 4);
+        assert(event_count == 1 && events[0] == MISSION_CONTROL_SHOW_FRONT_WINDOWS);
+        mission_control_notification_handler(NULL, NULL, kAXExposeExit, NULL);
+        mission_control_notification_handler(NULL, NULL, kAXExposeExit, NULL);
+        assert(event_count == 2 && events[1] == MISSION_CONTROL_EXIT);
+        mission_control_notification_handler(NULL, NULL, kAXExposeShowDesktop, NULL);
+        sample(@[window(888,18)], 4);
+        assert(event_count == 3 && events[2] == MISSION_CONTROL_SHOW_DESKTOP);
+        // Transition directly to full MC through its AX hint and native proof.
+        inventory = @[window(901,19), window(901,14)];
+        mission_control_notification_handler(NULL, NULL, kAXExposeShowAllWindows, NULL);
+        assert(event_count == 5 && events[3] == MISSION_CONTROL_EXIT &&
+               events[4] == MISSION_CONTROL_SHOW_ALL_WINDOWS);
+        mission_control_notification_handler(NULL, NULL, kAXExposeExit, NULL);
+        sample(inventory, 4);
+        assert(event_count == 5);
+        sample(@[], 3);
+        assert(event_count == 6 && events[5] == MISSION_CONTROL_EXIT);
+        // A later explicit App Expose callback can correct an earlier sample.
+        sample(@[window(888,18)], 1);
+        mission_control_notification_handler(NULL, NULL, kAXExposeShowFrontWindows, NULL);
+        sample(inventory, 4);
+        assert(event_count == 9 && events[6] == MISSION_CONTROL_SHOW_ALL_WINDOWS &&
+               events[7] == MISSION_CONTROL_EXIT && events[8] == MISSION_CONTROL_SHOW_FRONT_WINDOWS);
+        mission_control_notification_handler(NULL, NULL, kAXExposeExit, NULL);
+        assert(event_count == 10 && events[9] == MISSION_CONTROL_EXIT);
+        // Native WindowManager proof must still work if an auxiliary AX exit
+        // was missed and no full-Mission-Control AX hint is delivered.
+        mission_control_notification_handler(NULL, NULL, kAXExposeShowFrontWindows, NULL);
+        sample(@[window(901,19), window(901,14)], 1);
+        assert(event_count == 13 && events[10] == MISSION_CONTROL_SHOW_FRONT_WINDOWS &&
+               events[11] == MISSION_CONTROL_EXIT && events[12] == MISSION_CONTROL_SHOW_ALL_WINDOWS);
+        sample(@[], 3);
+        assert(event_count == 14 && events[13] == MISSION_CONTROL_EXIT);
+
         mission_control_unobserve();
         Block_release(tick);
-        puts("PASS: observer emits one enter/exit per confirmed surface session; false positives, gaps, restart, PID replacement and legacy path covered");
+        puts("PASS: runtime native signatures, owner changes, overlap, gaps, restart and AX modes");
     }
     return 0;
 }
